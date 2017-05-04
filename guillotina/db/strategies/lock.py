@@ -3,6 +3,7 @@ from guillotina.db import etcd
 from guillotina.db.interfaces import ILockingStrategy
 from guillotina.db.interfaces import IStorage
 from guillotina.db.interfaces import ITransaction
+from guillotina.db.strategies.base import BaseStrategy
 
 import asyncio
 import json
@@ -11,7 +12,7 @@ import json
 @configure.adapter(
     for_=(IStorage, ITransaction),
     provides=ILockingStrategy, name="lock")
-class LockStrategy:
+class LockStrategy(BaseStrategy):
     '''
     *this strategy relies on using etcd for locking*
 
@@ -38,6 +39,9 @@ class LockStrategy:
         self._etcd_client = self._storage._etcd_client
 
     async def tpc_begin(self):
+        if not self.writable_transaction:
+            return
+
         key = '{}-tid'.format(self._etcd_base_key)
         tid = 1
         tries = 0  # try to get new tid
@@ -68,6 +72,7 @@ class LockStrategy:
                     break
             tries += 1
             if tries >= 10:
+                asyncio.sleep(0.01)
                 raise Exception('Could not allocate tid for transaction, too busy'.format(
                     json.dumps(result)
                 ))
@@ -80,6 +85,9 @@ class LockStrategy:
         return True
 
     async def tpc_finish(self):
+        if not self.writable_transaction:
+            return
+
         for ob in self._transaction.modified.values():
             if ob.__locked__:
                 await self.unlock(ob)

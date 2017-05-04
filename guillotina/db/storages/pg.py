@@ -386,8 +386,6 @@ class PostgresqlStorage(BaseStorage):
         if transaction._db_txn is not None:
             async with transaction._lock:
                 await transaction._db_txn.rollback()
-        else:
-            log.warn('Do not have db transaction to rollback')
 
     # Introspection
 

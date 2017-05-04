@@ -135,7 +135,7 @@ async def traverse(request, parent, path):
         return parent, path
 
     if IDatabase.providedBy(context):
-        request._db_write_enabled = False
+        request._db_write_enabled = request.method in WRITING_VERBS
         request._db_id = context.id
         # Create a transaction Manager
         request._tm = context.new_transaction_manager()
@@ -223,7 +223,6 @@ class MatchInfo(AbstractMatchInfo):
         """Main handler function for aiohttp."""
         if request.method in WRITING_VERBS:
             try:
-                request._db_write_enabled = True
                 # We try to avoid collisions on the same instance of
                 # guillotina
                 view_result = await self.view()

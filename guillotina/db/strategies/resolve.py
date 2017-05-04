@@ -21,6 +21,9 @@ class ResolveStrategy(SimpleStrategy):
     '''
 
     async def tpc_vote(self):
+        if not self.writable_transaction:
+            return True
+
         current_tid = await self._storage.get_current_tid(self._transaction)
         if current_tid > self._transaction._tid:
             # potential conflict error, get changes
@@ -48,6 +51,9 @@ class MergeStrategy(SimpleStrategy):
     '''
 
     async def tpc_vote(self):
+        if not self.writable_transaction:
+            return True
+
         current_tid = await self._storage.get_current_tid(self._transaction)
         if current_tid > self._transaction._tid:
             # potential conflict error, get changes

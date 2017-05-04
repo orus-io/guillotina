@@ -2,7 +2,7 @@
 	"databases": [{
 		"db": {
 			"storage": "cockroach",
-			"transaction_strategy": "lock",
+			"transaction_strategy": "none",
       "dsn": "postgresql://root@127.0.0.1:26257/guillotina?sslmode=disable",
       "read_only": false,
 			"etcd": {
@@ -16,7 +16,8 @@
 				"read_timeout": 3,
 				"acquire_timeout": 3
 			},
-			"lock_ttl": 3
+			"lock_ttl": 3,
+			"pool_size": 100
 		}
 	}],
 	"host": "127.0.0.1",
