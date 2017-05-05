@@ -6,7 +6,6 @@ from guillotina.db.interfaces import ITransaction
 from guillotina.db.strategies.base import BaseStrategy
 
 import asyncio
-import json
 
 
 @configure.adapter(
@@ -43,40 +42,11 @@ class LockStrategy(BaseStrategy):
             return
 
         key = '{}-tid'.format(self._etcd_base_key)
-        tid = 1
-        tries = 0  # try to get new tid
-        while True:
-            # get current tid
-            result = await self._etcd_client.get(key)
-            if 'errorCode' in result:
-                if result['errorCode'] == 100:
-                    # no key, just set and we're good
-                    await self._etcd_client.set(key, tid, noValueOnSuccess='true')
-                    break
-                else:
-                    raise Exception('Could not allocate tid for transaction. etcd error {}'.format(
-                        json.dumps(result)
-                    ))
-            else:
-                existing_tid = result['node']['value']
-                tid = int(existing_tid) + 1
-                result = await self._etcd_client.set(key, tid, prevValue=existing_tid)
-                if 'errorCode' in result:
-                    if result['errorCode'] != 101:
-                        # 101 is okay, we'll retry. Others, throw unhandled errorCode
-                        raise Exception('Could not allocate tid for transaction. etcd error {}'.format(
-                            json.dumps(result)
-                        ))
-                else:
-                    # success!, break out
-                    break
-            tries += 1
-            if tries >= 10:
-                asyncio.sleep(0.01)
-                raise Exception('Could not allocate tid for transaction, too busy'.format(
-                    json.dumps(result)
-                ))
-        self._transaction._tid = tid
+        # instead of doing something complicated to get us a transaction,
+        # we are just going to write to the lock key and use the index value
+        # from the result for the tid value
+        result = await self._etcd_client.set(key, '1')
+        self._transaction._tid = result['node']['modifiedIndex']
 
     async def tpc_vote(self):
         """
@@ -96,6 +66,9 @@ class LockStrategy(BaseStrategy):
         return '{}-{}-lock'.format(self._etcd_base_key, ob._p_oid)
 
     async def _wait_for_lock(self, key):
+        '''
+        We should probably think of rewriting with wait=true instead of retrying
+        '''
         # this method *should* use the wait_for with a timeout
         result = await self._etcd_client.get(key)
         if 'node' in result:
