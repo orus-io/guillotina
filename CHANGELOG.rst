@@ -1,7 +1,8 @@
 1.0.0a18 (unreleased)
 ---------------------
 
-- Nothing changed yet.
+- Default transactions strategies need to start a transaction even for reads
+  [vangheem]
 
 
 1.0.0a17 (2017-05-05)

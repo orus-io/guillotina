@@ -14,9 +14,6 @@ class SimpleStrategy(BaseStrategy):
     '''
 
     async def tpc_begin(self):
-        if not self.writable_transaction:
-            return
-
         await self._storage.start_transaction(self._transaction)
         tid = await self._storage.get_next_tid(self._transaction)
         if tid is not None:
