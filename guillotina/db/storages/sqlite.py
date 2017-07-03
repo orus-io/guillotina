@@ -1,22 +1,24 @@
 from asyncio import shield
 from guillotina.db.interfaces import IStorage
-from guillotina.db.storages import base
+from guillotina.db.storages import base, pg
 from guillotina.db.storages.utils import get_table_definition
 from guillotina.exceptions import ConflictError
 from guillotina.exceptions import TIDConflictError
 from zope.interface import implementer
 
 import asyncio
-import asyncpg
 import concurrent
 import logging
-import ujson
+import ujson, sqlite3
 
 
 log = logging.getLogger("guillotina.storage")
 
 
-class PGVacuum:
+MAX_TID = "SELECT COALESCE(MAX(tid), 0) from objects;"
+
+
+class SQLiteVacuum:
 
     def __init__(self, storage, loop):
         self._storage = storage
@@ -32,14 +34,13 @@ class PGVacuum:
     async def initialize(self):
         # get existing trashed objects, push them on the queue...
         # there might be contention, but that is okay
-        conn = await self._storage.open()
+        conn = self._storage._read_conn
         try:
-            for record in await conn.fetch(base.GET_TRASHED_OBJECTS):
+            curse = conn.execute(base.GET_TRASHED_OBJECTS)
+            for record in curse.fetchall():
                 await self._queue.put(record['zoid'])
         except:
             log.warn('Error deleting trashed object', exc_info=True)
-        finally:
-            await self._storage.close(conn)
 
         while not self._closed:
             try:
@@ -64,16 +65,12 @@ class PGVacuum:
         '''
         DELETED objects has parent id changed to the trashed ob for the oid...
         '''
-        conn = await self._storage.open()
+        conn = self._storage._read_conn
         try:
-            await conn.execute(base.DELETE_OBJECT, oid)
+            curse = conn.execute(base.DELETE_OBJECT, oid)
+            curse.fetchall()
         except:
             log.warn('Error deleting trashed object', exc_info=True)
-        finally:
-            try:
-                await self._storage.close(conn)
-            except asyncpg.exceptions.ConnectionDoesNotExistError:
-                pass
 
     async def finalize(self):
         self._closed = True
@@ -93,39 +90,36 @@ class PGVacuum:
             await asyncio.sleep(0.1)
 
 
+class SQLiteTransaction:
+
+    def __init__(self, txn):
+        self._txn = txn
+        self._conn = txn._db_conn
+        self._storage = txn._manager._storage
+        self._status = 'none'
+
+    async def start(self):
+        assert self._status in ('none',)
+        self._conn.execute(f'''BEGIN TRANSACTION;''')
+        self._status = 'started'
+
+    async def commit(self):
+        assert self._status in ('started',)
+        self._conn.execute('COMMIT;')
+        self._status = 'committed'
+
+    async def rollback(self):
+        assert self._status in ('started',)
+        self._conn.execute('ROLLBACK;')
+        self._status = 'rolledback'
+
+
 @implementer(IStorage)
-class PostgresqlStorage(base.BaseStorage):
-    """Storage to a relational database, based on invalidation polling"""
+class SQLiteStorage(pg.PostgresqlStorage):
+    """Storage to sqlite"""
 
-    _dsn = None
-    _partition_class = None
-    _pool_size = None
-    _pool = None
-    _large_record_size = 1 << 24
-    _vacuum_class = PGVacuum
-
-    _object_schema = {
-        'zoid': 'VARCHAR(32) NOT NULL PRIMARY KEY',
-        'tid': 'BIGINT NOT NULL',
-        'state_size': 'BIGINT NOT NULL',
-        'part': 'BIGINT NOT NULL',
-        'resource': 'BOOLEAN NOT NULL',
-        'of': 'VARCHAR(32) REFERENCES objects ON DELETE CASCADE',
-        'otid': 'BIGINT',
-        'parent_id': 'VARCHAR(32) REFERENCES objects ON DELETE CASCADE',  # parent oid
-        'id': 'TEXT',
-        'type': 'TEXT NOT NULL',
-        'json': 'JSONB',
-        'state': 'BYTEA'
-    }
-
-    _blob_schema = {
-        'bid': 'VARCHAR(32) NOT NULL',
-        'zoid': 'VARCHAR(32) NOT NULL REFERENCES objects ON DELETE CASCADE',
-        'chunk_index': 'INT NOT NULL',
-        'data': 'BYTEA'
-    }
-
+    _loop = None
+    _vacuum_class = SQLiteVacuum
     _initialize_statements = [
         'CREATE INDEX IF NOT EXISTS object_tid ON objects (tid);',
         'CREATE INDEX IF NOT EXISTS object_of ON objects (of);',
@@ -134,31 +128,18 @@ class PostgresqlStorage(base.BaseStorage):
         'CREATE INDEX IF NOT EXISTS object_id ON objects (id);',
         'CREATE INDEX IF NOT EXISTS blob_bid ON blobs (bid);',
         'CREATE INDEX IF NOT EXISTS blob_zoid ON blobs (zoid);',
-        'CREATE INDEX IF NOT EXISTS blob_chunk ON blobs (chunk_index);',
-        'CREATE SEQUENCE IF NOT EXISTS tid_sequence;'
+        'CREATE INDEX IF NOT EXISTS blob_chunk ON blobs (chunk_index);'
     ]
 
-    def __init__(self, dsn=None, partition=None, read_only=False, name=None,
-                 pool_size=13, transaction_strategy='resolve',
-                 conn_acquire_timeout=20, cache_strategy='dummy', **options):
-        super(PostgresqlStorage, self).__init__(
-            read_only, transaction_strategy=transaction_strategy,
-            cache_strategy=cache_strategy)
-        self._dsn = dsn
-        self._pool_size = pool_size
-        self._partition_class = partition
-        self._read_only = read_only
-        self.__name__ = name
-        self._read_conn = None
-        self._lock = asyncio.Lock()
-        self._conn_acquire_timeout = conn_acquire_timeout
-        self._options = options
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._read_conn = sqlite3.connect(kwargs['dsn'])
 
     async def finalize(self):
         await self._vacuum.finalize()
         self._vacuum_task.cancel()
-        await shield(self._pool.release(self._read_conn))
-        await self._pool.close()
+        self._db_conn.close()
+        self._read_conn.close()
 
     async def create(self):
         # Check DB
@@ -171,38 +152,18 @@ class PostgresqlStorage(base.BaseStorage):
         statements.extend(self._initialize_statements)
 
         for statement in statements:
-            await self._read_conn.execute(statement)
-
-        await self.initialize_tid_statements()
-        # migrate old transaction table scheme over
-        try:
-            old_tid = await self._read_conn.fetchval('SELECT max(tid) from transaction')
-            current_tid = await self.get_current_tid(None)
-            if old_tid > current_tid:
-                await self._read_conn.execute(
-                    'ALTER SEQUENCE tid_sequence RESTART WITH ' + str(old_tid + 1))
-        except asyncpg.exceptions.UndefinedTableError:
-            # no need to upgrade
-            pass
+            curse = self._read_conn.execute(statement)
+            curse.fetchall()
 
     async def initialize(self, loop=None):
         if loop is None:
             loop = asyncio.get_event_loop()
-        self._pool = await asyncpg.create_pool(
-            dsn=self._dsn,
-            max_size=self._pool_size,
-            min_size=2,
-            loop=loop)
+        self._loop = loop
 
         # shared read connection on all transactions
-        self._read_conn = await self.open()
-        try:
-            await self.initialize_tid_statements()
-        except asyncpg.exceptions.UndefinedTableError:
-            await self.create()
-            await self.initialize_tid_statements()
+        await self.create()
 
-        await self._read_conn.execute(base.CREATE_TRASH)
+        self._read_conn.execute(base.CREATE_TRASH)
 
         self._vacuum = self._vacuum_class(self, loop)
         self._vacuum_task = asyncio.Task(self._vacuum.initialize(), loop=loop)
@@ -216,10 +177,6 @@ class PostgresqlStorage(base.BaseStorage):
 
         self._vacuum_task.add_done_callback(vacuum_done)
 
-    async def initialize_tid_statements(self):
-        self._stmt_next_tid = await self._read_conn.prepare(base.NEXT_TID)
-        self._stmt_max_tid = await self._read_conn.prepare(base.MAX_TID)
-
     async def remove(self):
         """Reset the tables"""
         async with self._pool.acquire() as conn:
@@ -227,14 +184,10 @@ class PostgresqlStorage(base.BaseStorage):
             await conn.execute("DROP TABLE IF EXISTS objects;")
 
     async def open(self):
-        conn = await self._pool.acquire(timeout=self._conn_acquire_timeout)
-        return conn
+        return sqlite3.connect(self._dsn)
 
     async def close(self, con):
-        try:
-            await shield(self._pool.release(con))
-        except (asyncio.CancelledError, asyncpg.exceptions.ConnectionDoesNotExistError):
-            pass
+        con.close()
 
     async def load(self, txn, oid):
         async with txn._lock:
@@ -280,19 +233,8 @@ class PostgresqlStorage(base.BaseStorage):
                     json,                # JSON catalog
                     p                    # Pickle state)
                 )
-            except asyncpg.exceptions.ForeignKeyViolationError:
-                txn.deleted[obj._p_oid] = obj
-                raise TIDConflictError(
-                    'Bad value inserting into database that could be caused '
-                    'by a bad cache value. This should resolve on request retry.')
-            except asyncpg.exceptions._base.InterfaceError as ex:
-                if 'another operation is in progress' in ex.args[0]:
-                    raise ConflictError(
-                        'asyncpg error, another operation in progress.')
-                raise
-            except asyncpg.exceptions.DeadlockDetectedError:
-                raise ConflictError(
-                    'Deadlock detected.')
+            except sqlite3.DatabaseError:
+                import pdb; pdb.set_trace()
             if len(result) != 1 or result[0]['count'] != 1:
                 if update:
                     # raise tid conflict error
@@ -317,45 +259,21 @@ class PostgresqlStorage(base.BaseStorage):
         async with self._lock:
             # we do not use transaction lock here but a storage lock because
             # a storage object has a shard conn for reads
-            return await self._stmt_next_tid.fetchval()
+            return await self.get_current_tid(txn) + 1
 
     async def get_current_tid(self, txn):
         async with self._lock:
             # again, use storage lock here instead of trns lock
-            return await self._stmt_max_tid.fetchval()
+            curse = self._read_conn.execute(MAX_TID)
+            return curse.fetchval()
 
     def _db_transaction_factory(self, txn):
-        # make sure asycpg knows this is a new transaction
-        if txn._db_conn._con is not None:
-            txn._db_conn._con._top_xact = None
-        return txn._db_conn.transaction(readonly=txn._manager._storage._read_only)
+        return SQLiteTransaction(txn)
 
-    async def start_transaction(self, txn, retries=0):
-        error = None
+    async def start_transaction(self, txn):
         async with txn._lock:
             txn._db_txn = self._db_transaction_factory(txn)
-            try:
-                await txn._db_txn.start()
-                return
-            except asyncpg.exceptions._base.InterfaceError as ex:
-                error = ex
-
-        if error is not None:
-            if retries > 2:
-                raise error
-
-            if ('manually started transaction' in error.args[0] or
-                    'connection is closed' in error.args[0]):
-                if 'manually started transaction' in error.args[0]:
-                    try:
-                        # thinks we're manually in txn, manually rollback and try again...
-                        await txn._db_conn.execute('ROLLBACK;')
-                    except asyncpg.exceptions._base.InterfaceError:
-                        # we're okay with this error here...
-                        pass
-                await self.close(txn._db_conn)
-                txn._db_conn = await self.open()
-                return await self.start_transaction(txn, retries + 1)
+            await txn._db_txn.start()
 
     async def get_conflicts(self, txn, full=False):
         async with self._lock:
@@ -378,7 +296,7 @@ class PostgresqlStorage(base.BaseStorage):
             async with transaction._lock:
                 try:
                     await transaction._db_txn.rollback()
-                except asyncpg.exceptions._base.InterfaceError:
+                except sqlite3.DatabaseError:
                     # we're okay with this error here...
                     pass
         # reads don't need transaction necessarily so don't log

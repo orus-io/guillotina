@@ -6,10 +6,15 @@ from guillotina.db.storages.pg import PostgresqlStorage
 from guillotina.factory.content import Database
 from guillotina.interfaces import IDatabaseConfigurationFactory
 from guillotina.utils import resolve_dotted_name
+try:
+    from guillotina.db.storages.sqlite import SQLiteStorage
+    HAS_AIOODBC = True
+except ImportError:
+    HAS_AIOODBC = False
 
 
-async def _PGConfigurationFactory(key, dbconfig, app,
-                                  storage_factory=PostgresqlStorage):
+async def _SQLConfigurationFactory(key, dbconfig, app,
+                                   storage_factory=PostgresqlStorage):
     # b/w compat, we don't use this for storage options anymore
     config = dbconfig.get('configuration', {})
     if isinstance(dbconfig['dsn'], str):
@@ -43,13 +48,19 @@ async def _PGConfigurationFactory(key, dbconfig, app,
 
 @configure.utility(provides=IDatabaseConfigurationFactory, name="postgresql")
 async def PGDatabaseConfigurationFactory(key, dbconfig, app):
-    return await _PGConfigurationFactory(key, dbconfig, app)
+    return await _SQLConfigurationFactory(key, dbconfig, app)
 
 
 @configure.utility(provides=IDatabaseConfigurationFactory, name="cockroach")
 async def CRDatabaseConfigurationFactory(key, dbconfig, app):
-    return await _PGConfigurationFactory(key, dbconfig, app,
-                                         storage_factory=CockroachStorage)
+    return await _SQLConfigurationFactory(key, dbconfig, app,
+                                          storage_factory=CockroachStorage)
+
+if HAS_AIOODBC:
+    @configure.utility(provides=IDatabaseConfigurationFactory, name="sqlite")
+    async def SQLiteDatabaseConfigurationFactory(key, dbconfig, app):
+        return await _SQLConfigurationFactory(key, dbconfig, app,
+                                              storage_factory=SQLiteStorage)
 
 
 @configure.utility(provides=IDatabaseConfigurationFactory, name="DUMMY")
