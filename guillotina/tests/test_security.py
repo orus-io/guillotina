@@ -178,8 +178,26 @@ async def test_allowsingle(container_requester):
             'POST',
             '/db/guillotina/',
             data=json.dumps({
-                '@type': 'Item',
+                '@type': 'Folder',
                 'id': 'testing'
+            }))
+        assert status == 201
+
+        response, status = await requester(
+            'POST',
+            '/db/guillotina/testing/',
+            data=json.dumps({
+                '@type': 'Item',
+                'id': 'test1'
+            }))
+        assert status == 201
+
+        response, status = await requester(
+            'POST',
+            '/db/guillotina/testing/',
+            data=json.dumps({
+                '@type': 'Item',
+                'id': 'test2'
             }))
         assert status == 201
 
@@ -204,6 +222,41 @@ async def test_allowsingle(container_requester):
                     'principal': 'group2',
                     'permission': 'guillotina.AccessContent',
                     'setting': 'Allow'
+                }, {
+                    'principal': 'group1',
+                    'permission': 'guillotina.ViewContent',
+                    'setting': 'AllowSingle'
+                }]
+            }))
+
+        assert status == 200
+
+        response, status = await requester(
+            'POST',
+            '/db/guillotina/testing/test1/@sharing',
+            data=json.dumps({
+                'prinperm': [{
+                    'principal': 'group3',
+                    'permission': 'guillotina.ViewContent',
+                    'setting': 'Allow'
+                }]
+            }))
+
+        assert status == 200
+
+        response, status = await requester(
+            'POST',
+            '/db/guillotina/testing/test2/@sharing',
+            data=json.dumps({
+                'prinrole': [{
+                    'principal': 'group2',
+                    'role': 'guillotina.Reader',
+                    'setting': 'Allow'
+                }],
+                'roleperm': [{
+                    'role': 'guillotina.Reader',
+                    'permission': 'guillotina.ViewContent',
+                    'setting': 'Allow'
                 }]
             }))
 
@@ -215,7 +268,7 @@ async def test_allowsingle(container_requester):
 
         user = GuillotinaUser(request)
         user.id = 'user1'
-        user._groups = ['group1', 'group2']
+        user._groups = ['group2', 'group1']
 
         utils.login(request, user)
 
@@ -234,3 +287,29 @@ async def test_allowsingle(container_requester):
                                                  request.container)
         assert not request.security.check_permission(
             'guillotina.AccessContent', content)
+
+        test1 = await content.async_get('test1')
+        test2 = await content.async_get('test2')
+
+        user = GuillotinaUser(request)
+        user.id = 'user2'
+        user._groups = ['group2', 'group3']
+
+        utils.login(request, user)
+
+        assert request.security.check_permission(
+            'guillotina.ViewContent', test1)
+        assert request.security.check_permission(
+            'guillotina.ViewContent', test2)
+
+
+        user = GuillotinaUser(request)
+        user.id = 'user2'
+        user._groups = ['group1', 'group2', 'group3']
+
+        utils.login(request, user)
+
+        assert request.security.check_permission(
+            'guillotina.ViewContent', test1)
+        assert request.security.check_permission(
+            'guillotina.ViewContent', test2)
